@@ -1,7 +1,7 @@
 services:
   ocr-scheduler:
     container_name: Ratatoskr
-    build: ./ratatoskr-scheduler
+    build: ./Ratatoskr-scheduler
     restart: unless-stopped
     env_file:
       - .env
