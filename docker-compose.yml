@@ -1,0 +1,46 @@
+services:
+  ocr-scheduler:
+    container_name: Ratatoskr
+    build: ./ratatoskr-scheduler
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - processor_network
+
+  ocr-service:
+    image: gunthercox/ocr-service:latest
+    container_name: GuntherOCR
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    networks:
+      - processor_network
+
+  bentobox:
+    container_name: Ratatoskr-BentoBox
+    build:
+      context: ./BentoBox
+      args:
+        CLIP_MODEL_ID: ${CLIP_MODEL_ID:-openai/clip-vit-base-patch32}
+    restart: unless-stopped
+    ports:
+      - ${CLIP_PORT:-3000}:${CLIP_PORT:-3000}
+    env_file:
+      - .env
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://192.168.1.69:${CLIP_PORT:-3000}/healthz')"]
+      interval: 10s
+      timeout: 3s
+      start_period: 60s
+      retries: 5
+    networks:
+      - processor_network
+
+volumes:
+  hf_cache:
+
+networks:
+  processor_network:      
