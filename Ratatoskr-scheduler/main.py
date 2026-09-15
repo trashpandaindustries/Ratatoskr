@@ -7,40 +7,79 @@ both `enabled` and `run_by_default`, filters those down to the ones whose
 `input_mime_types` match the asset's mime type, and runs each applicable
 one exactly once (idempotency checked against asset_interpretations).
 
-Two capabilities are implemented:
-    metadata  — local extraction via Pillow (image EXIF) or pypdf (PDF
-                document info + page count). No external service involved.
-    ocr       — delegates to a self-hosted OCR-Service
-                (https://github.com/gunthercox/ocr-service) over HTTP,
-                using the dispatched processor's `name` as the engine
-                param ("tesseract" or "paddleocr").
+Dispatch is keyed off `processors.type`, not `capability`:
+    internal  — runs a Python function looked up by `capability`
+                (currently just `metadata`: Pillow image EXIF / pypdf
+                document info). No external service involved.
+    http      — runs a *generic* handler driven entirely by data on the
+                processor row: `endpoint_url` + `request_template`
+                describe the outbound HTTP request, `output_mapping`
+                describes which fields of the JSON response to lift into
+                `asset_interpretations.raw_payload`/`confidence`. Adding a
+                new HTTP-backed processor (OCR engine, BentoBox caption,
+                CLIP embeddings, whatever comes next) is a `processors`
+                INSERT, not a code change — `capability` is just a label
+                for mime-matching, conditions, and logging on these.
 
-Which OCR engine runs automatically lives entirely in the `processors`
-table now (`run_by_default`) — there's no OCR_ENGINE env var anymore.
-Switch engines with:
+`request_template` shape (JSONB), interpreted by handle_http_json:
+    {
+      "method": "POST",
+      "headers": {"accept": "application/json"},
+      "multipart": {
+        "<field name>": {"source": "asset_bytes", "content_type": "..."},
+        "<field name>": {"source": "config_json"}
+      }
+    }
+`source` is one of:
+    asset_bytes  — the downloaded file body (uses asset's mime_type
+                   unless the field overrides content_type)
+    config_json  — the resolved config (default_config ⊕ job override),
+                   JSON-encoded
+
+`output_mapping` shape (JSONB):
+    {"text_path": "caption", "confidence_path": "confidence"}
+Dotted paths into the JSON response; missing/absent paths just resolve to
+None rather than raising. The full response is always stored in
+raw_payload regardless of what output_mapping pulls out.
+
+Conditional dispatch (`dispatch_condition`, JSONB, nullable):
+    {"source_capability": "metadata", "path": "exif.Make", "op": "in",
+     "value": ["Canon", "NIKON CORPORATION", "SONY"]}
+Lets one capability's dispatch depend on another's *already-stored*
+interpretation for the same asset — e.g. only run paddleocr on images
+whose EXIF Make looks like a DSLR, while still captioning everything.
+If the dependency hasn't produced an interpretation yet, the processor is
+skipped for this poll cycle (not treated as an error) and picked back up
+once it exists — matches contains a query, e.g.
+    {"path": "width", "op": "gt", "value": 1024}
+Unconditioned processors are dispatched before conditioned ones within a
+single poll so same-cycle dependencies (metadata -> paddleocr) usually
+resolve without waiting for a second loop.
+
+Which processors run automatically lives entirely in the `processors`
+table (`run_by_default`) — no OCR_ENGINE/OCR_SERVICE_URL env vars. Switch
+engines with:
     UPDATE processors SET run_by_default = false WHERE name = 'tesseract';
     UPDATE processors SET run_by_default = true  WHERE name = 'paddleocr';
 (the partial unique index on processors enforces exactly one default per
 capability, so those have to be two separate statements.)
 
-Per-processor settings (e.g. OCR language) now live in `processors` too,
-not env vars: `config_schema` declares what's configurable for that
-specific processor row, `default_config` holds the actual defaults, and
+Per-processor settings (e.g. OCR language) live in `processors`, not env
+vars: `config_schema` declares what's configurable for that specific
+processor row, `default_config` holds the actual defaults, and
 `processing_jobs.configuration` is a per-job override. Dispatch resolves
 default_config merged with job.configuration, validated field-by-field
 against config_schema — unknown keys or wrong types are dropped with a
-log line rather than sent through. There's no OCR_LANG env var anymore;
-tesseract and paddleocr each carry their own correct default language
-code, since they don't share a code vocabulary.
+log line rather than sent through.
 
 Required env vars:
     SUPABASE_URL            e.g. https://your-project.supabase.co
     SUPABASE_KEY            service_role key (Storage read + table access)
     SUPABASE_BUCKET         exact bucket name to watch
-    OCR_SERVICE_URL         e.g. http://ocr-service:5000
     POLL_INTERVAL_SECONDS   default: 10
 """
 import io
+import json
 import os
 import time
 import traceback
@@ -56,11 +95,27 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 SUPABASE_BUCKET = os.environ["SUPABASE_BUCKET"]
 
-OCR_SERVICE_URL = os.environ.get("OCR_SERVICE_URL", "http://ocr-service:5000")
-
 POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "10"))
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+# ============================================================
+# small shared helper — dotted-path lookup into JSON payloads
+# ============================================================
+
+def _dig(payload, path: Optional[str]):
+    """Walk a dotted path ('exif.Make', 'result.caption') into a dict,
+    returning None on any missing key or non-dict intermediate rather
+    than raising. Used for both output_mapping and dispatch_condition."""
+    if not path or not isinstance(payload, dict):
+        return None
+    cur = payload
+    for key in path.split("."):
+        if not isinstance(cur, dict) or key not in cur:
+            return None
+        cur = cur[key]
+    return cur
 
 
 # ============================================================
@@ -69,11 +124,15 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def get_dispatchable_processors():
     """All enabled + run_by_default processors. Refetched every poll so a
-    default-engine flip in the DB takes effect on the next cycle without a
-    restart."""
+    default-engine flip or a newly-added processor row takes effect on
+    the next cycle without a restart."""
     result = (
         supabase.table("processors")
-        .select("id, name, capability, input_mime_types, config_schema, default_config")
+        .select(
+            "id, name, capability, type, endpoint_url, input_mime_types, "
+            "config_schema, default_config, request_template, "
+            "output_mapping, dispatch_condition"
+        )
         .eq("enabled", True)
         .eq("run_by_default", True)
         .execute()
@@ -94,6 +153,18 @@ def applicable_processors(processors: list, mime_type: str) -> list:
         p for p in processors
         if any(mime_matches(pat, mime_type) for pat in (p.get("input_mime_types") or []))
     ]
+
+
+def build_capability_index(processors: list) -> dict:
+    """capability -> [processor ids]. Used to resolve dispatch_condition's
+    source_capability into the set of processor rows whose interpretation
+    would satisfy it — a condition points at a capability, not a specific
+    processor, so e.g. swapping tesseract for paddleocr as the default OCR
+    engine doesn't break anything downstream that conditions on 'ocr'."""
+    idx = {}
+    for p in processors:
+        idx.setdefault(p["capability"], []).append(p["id"])
+    return idx
 
 
 # ============================================================
@@ -136,6 +207,66 @@ def resolve_config(processor: dict, job_configuration: dict) -> dict:
         resolved[key] = value
 
     return resolved
+
+
+# ============================================================
+# conditional dispatch — gate a processor on another's stored output
+# ============================================================
+
+def get_source_payload(asset_id: str, processor_ids: list) -> Optional[dict]:
+    """Fetch the raw_payload of any existing interpretation on this asset
+    from one of the given processor ids (i.e. any processor that provides
+    the condition's source_capability). Returns None if none has run yet
+    — the caller treats that as "dependency not ready", not an error."""
+    if not processor_ids:
+        return None
+    result = (
+        supabase.table("asset_interpretations")
+        .select("raw_payload")
+        .eq("asset_id", asset_id)
+        .in_("processor_id", processor_ids)
+        .limit(1)
+        .execute()
+    )
+    return result.data[0]["raw_payload"] if result.data else None
+
+
+def condition_met(asset_id: str, condition: Optional[dict], capability_index: dict) -> bool:
+    if not condition:
+        return True  # no condition declared — always applicable
+
+    source_ids = capability_index.get(condition.get("source_capability", "metadata"), [])
+    payload = get_source_payload(asset_id, source_ids)
+    if payload is None:
+        return False  # dependency hasn't produced an interpretation yet — retry next poll
+
+    value = _dig(payload, condition.get("path"))
+    op = condition.get("op", "exists")
+    target = condition.get("value")
+
+    if op == "exists":
+        return value is not None
+    if op == "not_exists":
+        return value is None
+    if op == "eq":
+        return value == target
+    if op == "neq":
+        return value != target
+    if op == "in":
+        return value in (target or [])
+    if op == "not_in":
+        return value not in (target or [])
+    if op == "gt":
+        return value is not None and value > target
+    if op == "gte":
+        return value is not None and value >= target
+    if op == "lt":
+        return value is not None and value < target
+    if op == "lte":
+        return value is not None and value <= target
+
+    print(f"[scheduler] unknown dispatch_condition op '{op}' — treating as not met")
+    return False
 
 
 # ============================================================
@@ -184,7 +315,7 @@ def get_or_create_asset(file_info: dict):
 
 
 # ============================================================
-# job bookkeeping (parametrized by processor_id now, not one global engine)
+# job bookkeeping (parametrized by processor_id, not one global engine)
 # ============================================================
 
 def already_processed(asset_id: str, processor_id: str) -> bool:
@@ -243,7 +374,7 @@ def store_interpretation(
 
 
 # ============================================================
-# metadata capability — local extraction, no external service
+# internal capability — metadata (Pillow EXIF / pypdf), no HTTP involved
 # ============================================================
 
 def _sanitize(value):
@@ -306,48 +437,97 @@ def handle_metadata(asset_id, job_id, processor, file_bytes, name, mime_type, re
     store_interpretation(asset_id, job_id, processor["id"], processor["name"], payload)
 
 
+INTERNAL_HANDLERS = {
+    "metadata": handle_metadata,
+}
+
+
 # ============================================================
-# ocr capability — delegates to OCR-Service
+# http capability — generic, template-driven request/response handling
 # ============================================================
 
-def run_ocr(file_bytes: bytes, filename: str, engine: str, lang: str) -> dict:
-    resp = requests.post(
-        OCR_SERVICE_URL.rstrip("/") + "/",
-        files={"image": (filename, file_bytes)},
-        data={"engine": engine, "lang": lang},
+def handle_http_json(asset_id, job_id, processor, file_bytes, name, mime_type, resolved_config):
+    """Runs ANY http-type processor purely from its `request_template` +
+    `output_mapping` — no per-service Python needed. OCR, BentoBox
+    captioning, future CLIP/text-embedding endpoints, etc. all go through
+    this one function as long as they speak multipart-in/JSON-out."""
+    endpoint_url = processor.get("endpoint_url")
+    if not endpoint_url:
+        raise RuntimeError(f"processor '{processor['name']}' is type=http but has no endpoint_url")
+
+    template = processor.get("request_template") or {}
+
+    files = {}
+    data = {}
+    for field, spec in (template.get("multipart") or {}).items():
+        source = spec.get("source")
+        if source == "asset_bytes":
+            content_type = spec.get("content_type") or mime_type
+            files[field] = (name, file_bytes, content_type)
+        elif source == "config_json":
+            data[field] = json.dumps(resolved_config)
+        elif source == "config_field":
+            key = spec.get("key")
+            if key is None or key not in resolved_config:
+                print(
+                    f"[scheduler] processor '{processor['name']}': config_field "
+                    f"'{key}' not present in resolved config — skipping field '{field}'"
+                )
+                continue
+            data[field] = resolved_config[key]
+        else:
+            print(
+                f"[scheduler] processor '{processor['name']}': unknown multipart "
+                f"source '{source}' for field '{field}' — skipping field"
+            )
+
+    resp = requests.request(
+        template.get("method", "POST"),
+        endpoint_url,
+        headers=template.get("headers") or {},
+        files=files or None,
+        data=data or None,
         timeout=120,
     )
     resp.raise_for_status()
-    return resp.json()
+    payload = resp.json()
 
+    output_mapping = processor.get("output_mapping") or {}
+    confidence = _dig(payload, output_mapping.get("confidence_path"))
+    if confidence is not None:
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            confidence = None
 
-def average_confidence(regions: list) -> Optional[float]:
-    scores = [r["confidence"] for r in regions if "confidence" in r]
-    return sum(scores) / len(scores) if scores else None
-
-
-def handle_ocr(asset_id, job_id, processor, file_bytes, name, mime_type, resolved_config):
-    lang = resolved_config.get("lang", "eng")
-    ocr_result = run_ocr(file_bytes, name, engine=processor["name"], lang=lang)
-    regions = ocr_result.get("regions", [])
-    payload = {"raw_text": ocr_result.get("text", ""), "regions": regions}
     store_interpretation(
         asset_id, job_id, processor["id"], processor["name"],
-        payload, confidence=average_confidence(regions),
+        raw_payload=payload, confidence=confidence,
     )
 
 
-CAPABILITY_HANDLERS = {
-    "metadata": handle_metadata,
-    "ocr": handle_ocr,
-}
+# ============================================================
+# dispatch — `type` decides HOW to run, `capability` is just a label
+# ============================================================
+
+def dispatch_processor(asset_id, job_id, processor, file_bytes, name, mime_type, resolved_config):
+    ptype = processor.get("type", "internal")
+    if ptype == "internal":
+        handler = INTERNAL_HANDLERS.get(processor["capability"])
+        if not handler:
+            raise RuntimeError(f"no internal handler for capability '{processor['capability']}'")
+        handler(asset_id, job_id, processor, file_bytes, name, mime_type, resolved_config)
+    elif ptype == "http":
+        handle_http_json(asset_id, job_id, processor, file_bytes, name, mime_type, resolved_config)
+    else:
+        raise RuntimeError(f"unknown processor type '{ptype}'")
 
 
 # ============================================================
 # per-asset dispatch
 # ============================================================
 
-def process_file(file_info: dict, processors: list):
+def process_file(file_info: dict, processors: list, capability_index: dict):
     name = file_info["name"]
     asset_id, mime_type = get_or_create_asset(file_info)
     if not mime_type:
@@ -357,16 +537,18 @@ def process_file(file_info: dict, processors: list):
     if not matches:
         return
 
+    # Unconditioned processors first, so a same-cycle dependency (e.g.
+    # metadata -> paddleocr gated on EXIF) usually resolves without
+    # waiting for the next poll.
+    matches = sorted(matches, key=lambda p: p.get("dispatch_condition") is not None)
+
     file_bytes = None  # only fetched from Storage if something actually needs it
     for processor in matches:
         if already_processed(asset_id, processor["id"]):
             continue
 
-        handler = CAPABILITY_HANDLERS.get(processor["capability"])
-        if not handler:
-            print(f"[scheduler] no handler for capability '{processor['capability']}' "
-                  f"(processor '{processor['name']}') — skipping")
-            continue
+        if not condition_met(asset_id, processor.get("dispatch_condition"), capability_index):
+            continue  # dependency not ready yet — retry next poll
 
         if file_bytes is None:
             file_bytes = supabase.storage.from_(SUPABASE_BUCKET).download(name)
@@ -374,7 +556,7 @@ def process_file(file_info: dict, processors: list):
         job = create_job(asset_id, processor["id"])
         resolved_config = resolve_config(processor, job.get("configuration") or {})
         try:
-            handler(asset_id, job["id"], processor, file_bytes, name, mime_type, resolved_config)
+            dispatch_processor(asset_id, job["id"], processor, file_bytes, name, mime_type, resolved_config)
             mark_job(job["id"], "complete")
             print(f"[scheduler] {name}: {processor['name']} ({processor['capability']}) complete")
         except Exception as exc:  # noqa: BLE001
@@ -384,17 +566,15 @@ def process_file(file_info: dict, processors: list):
 
 
 def main():
-    print(
-        f"[scheduler] starting — bucket={SUPABASE_BUCKET} "
-        f"ocr_url={OCR_SERVICE_URL} poll={POLL_INTERVAL_SECONDS}s"
-    )
+    print(f"[scheduler] starting — bucket={SUPABASE_BUCKET} poll={POLL_INTERVAL_SECONDS}s")
     while True:
         try:
             processors = get_dispatchable_processors()
             if not processors:
                 print("[scheduler] no run_by_default+enabled processors found — nothing to dispatch")
+            capability_index = build_capability_index(processors)
             for file_info in list_bucket_files():
-                process_file(file_info, processors)
+                process_file(file_info, processors, capability_index)
         except Exception as exc:  # noqa: BLE001
             print(f"[scheduler] poll loop error: {exc}")
             traceback.print_exc()
