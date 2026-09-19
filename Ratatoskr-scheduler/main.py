@@ -2,10 +2,49 @@
 Ratatoskr — capability-dispatching scheduler.
 
 Polls one Supabase Storage bucket, registers any new object as an `assets`
-row, then for each object asks the `processors` table which processors are
-both `enabled` and `run_by_default`, filters those down to the ones whose
-`input_mime_types` match the asset's mime type, and runs each applicable
-one exactly once (idempotency checked against asset_interpretations).
+row, then for each object resolves a workflow and runs it.
+
+Two dispatch paths, tried in order:
+
+    contracts  — the `contracts` table holds versioned, ordered pipelines
+                 ({"contract_id", "version", "trigger", "match",
+                 "pipeline"}). For each asset, the most specific enabled
+                 `trigger='ingest'` contract whose `match.mimetype`
+                 matches the asset's mime type is selected (exact match
+                 beats a wildcard). Its `pipeline` is an ordered list of
+                 stages:
+                     {"id": "text", "processor": "gunthercox",
+                      "operation": "ocr", "config": {...}, "condition": {...}}
+                 `(processor, operation)` resolves to exactly one
+                 `processors` row via that row's `service` + `capability`
+                 columns. `config` is a per-stage override merged over
+                 that processor's `default_config` — this is what lets
+                 the same processor row appear in a pipeline more than
+                 once with different settings (e.g. gunthercox-ocr called
+                 once with no override, once with
+                 {"engine": "paddleocr", "lang": "ch"}). `condition`, if
+                 present, overrides the processor row's own
+                 `dispatch_condition` for this stage only; if absent, the
+                 row's own condition (if any) still applies.
+                 Match is mimetype-only for now — metadata-based
+                 matching would need metadata that a pipeline stage
+                 hasn't necessarily produced yet at resolution time, so
+                 that case stays handled by per-stage `condition`
+                 (checked against already-stored interpretations)
+                 instead of being promoted to top-level `match`.
+
+    run_by_default — the original mechanism: any enabled processor row
+                 flagged `run_by_default` whose `input_mime_types`
+                 matches. Used only when no contract matches the asset's
+                 mime type, so mime types without a defined contract yet
+                 keep working exactly as before.
+
+Because a contract can invoke the same processor more than once per
+asset (different stages, different config), idempotency and the
+`processing_jobs` uniqueness are keyed on `(asset_id, processor_id,
+stage_id)`, not just `(asset_id, processor_id)`. The legacy path uses a
+fixed `stage_id` of `'_default'`, preserving its original one-job-ever
+semantics.
 
 Dispatch is keyed off `processors.type`, not `capability`:
     internal  — runs a Python function looked up by `capability`
@@ -18,8 +57,7 @@ Dispatch is keyed off `processors.type`, not `capability`:
                 `asset_interpretations.raw_payload`/`confidence`. Adding a
                 new HTTP-backed processor (OCR engine, BentoBox caption,
                 CLIP embeddings, whatever comes next) is a `processors`
-                INSERT, not a code change — `capability` is just a label
-                for mime-matching, conditions, and logging on these.
+                INSERT, not a code change.
 
 `request_template` shape (JSONB), interpreted by handle_http_json:
     {
@@ -35,6 +73,8 @@ Dispatch is keyed off `processors.type`, not `capability`:
                    unless the field overrides content_type)
     config_json  — the resolved config (default_config ⊕ job override),
                    JSON-encoded
+    config_field — a single named key out of the resolved config (e.g.
+                   "engine", "lang"), sent as its own multipart field
 
 `output_mapping` shape (JSONB):
     {"text_path": "caption", "confidence_path": "confidence"}
@@ -42,35 +82,28 @@ Dotted paths into the JSON response; missing/absent paths just resolve to
 None rather than raising. The full response is always stored in
 raw_payload regardless of what output_mapping pulls out.
 
-Conditional dispatch (`dispatch_condition`, JSONB, nullable):
+dispatch_condition / stage condition (same shape either way):
     {"source_capability": "metadata", "path": "exif.Make", "op": "in",
      "value": ["Canon", "NIKON CORPORATION", "SONY"]}
-Lets one capability's dispatch depend on another's *already-stored*
-interpretation for the same asset — e.g. only run paddleocr on images
-whose EXIF Make looks like a DSLR, while still captioning everything.
-If the dependency hasn't produced an interpretation yet, the processor is
-skipped for this poll cycle (not treated as an error) and picked back up
-once it exists — matches contains a query, e.g.
-    {"path": "width", "op": "gt", "value": 1024}
-Unconditioned processors are dispatched before conditioned ones within a
-single poll so same-cycle dependencies (metadata -> paddleocr) usually
-resolve without waiting for a second loop.
+Lets a stage depend on another capability's *already-stored*
+interpretation for the same asset. If the dependency hasn't produced an
+interpretation yet, the stage is skipped for this poll cycle (not
+treated as an error) and picked back up once it exists — the capability
+index used to resolve `source_capability` is built from every enabled
+processor, not just run_by_default ones, so a stage can depend on a
+capability that only ever runs via a contract.
 
-Which processors run automatically lives entirely in the `processors`
-table (`run_by_default`) — no OCR_ENGINE/OCR_SERVICE_URL env vars. Switch
-engines with:
-    UPDATE processors SET run_by_default = false WHERE name = 'tesseract';
-    UPDATE processors SET run_by_default = true  WHERE name = 'paddleocr';
-(the partial unique index on processors enforces exactly one default per
-capability, so those have to be two separate statements.)
-
-Per-processor settings (e.g. OCR language) live in `processors`, not env
-vars: `config_schema` declares what's configurable for that specific
-processor row, `default_config` holds the actual defaults, and
-`processing_jobs.configuration` is a per-job override. Dispatch resolves
-default_config merged with job.configuration, validated field-by-field
-against config_schema — unknown keys or wrong types are dropped with a
-log line rather than sent through.
+Per-processor settings live in `processors`, not env vars: `config_schema`
+documents what a processor's API accepts (informal — nothing at dispatch
+time enforces it, it's there for a human or a future Skuld config UI),
+`default_config` holds the actual defaults, and either
+`processing_jobs.configuration` (legacy path) or a stage's `config`
+(contract path) supplies a per-job override. Dispatch resolves
+default_config merged with that override — override values always win,
+unvalidated. We don't own most of these downstream APIs, so a bad
+key/value either gets ignored by the processor's own API or comes back as
+an error response, which surfaces through the ordinary job-failure path
+rather than being silently dropped before the request is even sent.
 
 Required env vars:
     SUPABASE_URL            e.g. https://your-project.supabase.co
@@ -97,6 +130,8 @@ SUPABASE_BUCKET = os.environ["SUPABASE_BUCKET"]
 
 POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "10"))
 
+DEFAULT_STAGE_ID = "_default"
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
@@ -119,22 +154,37 @@ def _dig(payload, path: Optional[str]):
 
 
 # ============================================================
-# processor discovery / dispatch matching
+# processor / contract discovery
 # ============================================================
 
-def get_dispatchable_processors():
-    """All enabled + run_by_default processors. Refetched every poll so a
-    default-engine flip or a newly-added processor row takes effect on
-    the next cycle without a restart."""
+def get_all_enabled_processors():
+    """Every enabled processor, regardless of run_by_default. Used to
+    build both the capability index (for dispatch_condition/stage
+    condition sourcing) and the service+capability lookup contracts
+    resolve against — a contract stage can invoke a processor that isn't
+    anyone's run_by_default."""
     result = (
         supabase.table("processors")
         .select(
-            "id, name, capability, type, endpoint_url, input_mime_types, "
-            "config_schema, default_config, request_template, "
-            "output_mapping, dispatch_condition"
+            "id, name, capability, service, type, endpoint_url, input_mime_types, "
+            "config_schema, default_config, request_template, output_mapping, "
+            "dispatch_condition, run_by_default"
         )
         .eq("enabled", True)
-        .eq("run_by_default", True)
+        .execute()
+    )
+    return result.data
+
+
+def get_contracts():
+    """Enabled, ingest-triggered contracts. Refetched every poll, same
+    reasoning as processors — a newly-added or disabled contract takes
+    effect on the next cycle without a restart."""
+    result = (
+        supabase.table("contracts")
+        .select("id, contract_id, version, trigger, match, pipeline")
+        .eq("enabled", True)
+        .eq("trigger", "ingest")
         .execute()
     )
     return result.data
@@ -156,68 +206,111 @@ def applicable_processors(processors: list, mime_type: str) -> list:
 
 
 def build_capability_index(processors: list) -> dict:
-    """capability -> [processor ids]. Used to resolve dispatch_condition's
-    source_capability into the set of processor rows whose interpretation
-    would satisfy it — a condition points at a capability, not a specific
-    processor, so e.g. swapping tesseract for paddleocr as the default OCR
-    engine doesn't break anything downstream that conditions on 'ocr'."""
+    """capability -> [processor ids], built from ALL enabled processors
+    (not just run_by_default ones) so a condition can depend on a
+    capability that only runs inside a contract."""
     idx = {}
     for p in processors:
         idx.setdefault(p["capability"], []).append(p["id"])
     return idx
 
 
-# ============================================================
-# per-processor configuration contracts
-# ============================================================
-
-def _type_matches(value, expected_type: Optional[str]) -> bool:
-    if expected_type is None:
-        return True  # no declared type — nothing to check against
-    if expected_type == "string":
-        return isinstance(value, str)
-    if expected_type == "integer":
-        return isinstance(value, int) and not isinstance(value, bool)
-    if expected_type == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if expected_type == "boolean":
-        return isinstance(value, bool)
-    return True  # unrecognized type name in the schema — don't block on it
-
-
-def resolve_config(processor: dict, job_configuration: dict) -> dict:
-    """Merge this processor's default_config with a per-job override,
-    validating each overridden field against config_schema. Unknown keys
-    or wrong types are dropped (with a log line) rather than passed
-    through — a bad override should never silently reach the processor."""
-    schema = processor.get("config_schema") or {}
-    resolved = dict(processor.get("default_config") or {})
-
-    for key, value in (job_configuration or {}).items():
-        field_schema = schema.get(key)
-        if field_schema is None:
-            print(f"[scheduler] ignoring unknown config key '{key}' for processor '{processor['name']}'")
-            continue
-        if not _type_matches(value, field_schema.get("type")):
+def build_processor_lookup(processors: list) -> dict:
+    """(service, capability) -> processor row, for resolving a contract
+    stage's (processor, operation) pair. If more than one enabled row
+    shares a (service, capability) pair, prefer the run_by_default one
+    and log — this shouldn't happen post-consolidation, but fail loud
+    rather than silently picking an arbitrary row if it ever does."""
+    lookup = {}
+    for p in processors:
+        key = (p.get("service"), p.get("capability"))
+        existing = lookup.get(key)
+        if existing is None:
+            lookup[key] = p
+        elif p.get("run_by_default") and not existing.get("run_by_default"):
+            lookup[key] = p
+        else:
             print(
-                f"[scheduler] ignoring config key '{key}' for processor '{processor['name']}': "
-                f"expected {field_schema.get('type')}, got {type(value).__name__}"
+                f"[scheduler] multiple processors for service='{key[0]}' "
+                f"capability='{key[1]}' — using '{lookup[key]['name']}', ignoring '{p['name']}'"
+            )
+    return lookup
+
+
+def mimetype_specificity(pattern: Optional[str], mime_type: str) -> Optional[int]:
+    """None if pattern doesn't match; 2 for an exact mimetype match, 1
+    for a wildcard match. Higher wins when more than one contract could
+    apply to the same asset."""
+    if not pattern or not mime_matches(pattern, mime_type):
+        return None
+    return 2 if pattern == mime_type else 1
+
+
+def match_contract(contracts: list, mime_type: str) -> Optional[dict]:
+    best = None
+    best_score = -1
+    for c in contracts:
+        pattern = (c.get("match") or {}).get("mimetype")
+        score = mimetype_specificity(pattern, mime_type)
+        if score is None:
+            continue
+        if score > best_score:
+            best, best_score = c, score
+        elif score == best_score:
+            print(
+                f"[scheduler] ambiguous contract match for mime '{mime_type}': "
+                f"keeping '{best['contract_id']}'@{best['version']}, ignoring "
+                f"'{c['contract_id']}'@{c['version']}'"
+            )
+    return best
+
+
+def resolve_pipeline_stages(contract: dict, processor_lookup: dict) -> list:
+    """[(stage, processor), ...] in the contract's declared pipeline
+    order. A stage referencing a (processor, operation) pair with no
+    matching enabled processors row is logged and skipped, not fatal —
+    the rest of the pipeline still runs."""
+    stages = []
+    for stage in contract.get("pipeline") or []:
+        key = (stage.get("processor"), stage.get("operation"))
+        processor = processor_lookup.get(key)
+        if processor is None:
+            print(
+                f"[scheduler] contract '{contract['contract_id']}'@{contract['version']} "
+                f"stage '{stage.get('id')}': no enabled processor for "
+                f"service='{key[0]}' operation='{key[1]}' — skipping stage"
             )
             continue
-        resolved[key] = value
-
-    return resolved
+        stages.append((stage, processor))
+    return stages
 
 
 # ============================================================
-# conditional dispatch — gate a processor on another's stored output
+# per-processor configuration — plain override-merge, no validation
+# ============================================================
+
+def resolve_config(processor: dict, override: dict) -> dict:
+    """Merge this processor's default_config with an override (job's
+    stored `configuration`, or a contract stage's `config`). Override
+    values always win. Deliberately unvalidated: config_schema is
+    documentation, not an enforcement gate — we don't control most of
+    these downstream APIs, so a bad key/value either gets ignored by the
+    processor's own API or comes back as an error response, surfacing
+    through mark_job("failed", ...) rather than disappearing silently."""
+    return {**(processor.get("default_config") or {}), **(override or {})}
+
+
+# ============================================================
+# conditional dispatch — gate a stage on another's stored output
 # ============================================================
 
 def get_source_payload(asset_id: str, processor_ids: list) -> Optional[dict]:
     """Fetch the raw_payload of any existing interpretation on this asset
-    from one of the given processor ids (i.e. any processor that provides
-    the condition's source_capability). Returns None if none has run yet
-    — the caller treats that as "dependency not ready", not an error."""
+    from one of the given processor ids. Returns None if none has run
+    yet — the caller treats that as "dependency not ready", not an
+    error. Queried fresh each call, so a dependency produced earlier in
+    the SAME poll cycle (an earlier stage in pipeline order) is already
+    visible here — no need to wait for the next poll."""
     if not processor_ids:
         return None
     result = (
@@ -315,37 +408,53 @@ def get_or_create_asset(file_info: dict):
 
 
 # ============================================================
-# job bookkeeping (parametrized by processor_id, not one global engine)
+# job bookkeeping — keyed on (asset_id, processor_id, stage_id)
 # ============================================================
 
-def already_processed(asset_id: str, processor_id: str) -> bool:
+def already_processed(asset_id: str, processor_id: str, stage_id: str = DEFAULT_STAGE_ID) -> bool:
+    """True if a COMPLETE job already exists for this exact
+    (asset, processor, stage). Checking job status rather than
+    asset_interpretations existence means a previously FAILED stage is
+    retried on the next poll rather than treated as done."""
     existing = (
-        supabase.table("asset_interpretations")
+        supabase.table("processing_jobs")
         .select("id")
         .eq("asset_id", asset_id)
         .eq("processor_id", processor_id)
+        .eq("stage_id", stage_id)
+        .eq("status", "complete")
         .execute()
     )
     return bool(existing.data)
 
 
-def create_job(asset_id: str, processor_id: str) -> dict:
-    """Upsert rather than insert: a row for this (asset_id, processor_id)
-    may already exist from an earlier attempt. Reuse it instead of
-    colliding with the UNIQUE constraint. Returns the full row (not just
-    the id) so the caller can pick up any pre-existing `configuration`
-    override and merge it against the processor's defaults."""
+def create_job(
+    asset_id: str,
+    processor_id: str,
+    stage_id: str = DEFAULT_STAGE_ID,
+    contract_id: Optional[str] = None,
+    contract_version: Optional[int] = None,
+    configuration: Optional[dict] = None,
+) -> dict:
+    """Upsert on (asset_id, processor_id, stage_id) — a row for this
+    exact stage may already exist from an earlier attempt. configuration
+    is only included in the upsert payload when explicitly provided, so
+    the legacy path (which never passes it) leaves any manually-set
+    processing_jobs.configuration alone on retry instead of clobbering it."""
+    fields = {
+        "asset_id": asset_id,
+        "processor_id": processor_id,
+        "stage_id": stage_id,
+        "status": "processing",
+        "error_message": None,
+        "contract_id": contract_id,
+        "contract_version": contract_version,
+    }
+    if configuration is not None:
+        fields["configuration"] = configuration
     row = (
         supabase.table("processing_jobs")
-        .upsert(
-            {
-                "asset_id": asset_id,
-                "processor_id": processor_id,
-                "status": "processing",
-                "error_message": None,
-            },
-            on_conflict="asset_id,processor_id",
-        )
+        .upsert(fields, on_conflict="asset_id,processor_id,stage_id")
         .execute()
     )
     return row.data[0]
@@ -448,9 +557,7 @@ INTERNAL_HANDLERS = {
 
 def handle_http_json(asset_id, job_id, processor, file_bytes, name, mime_type, resolved_config):
     """Runs ANY http-type processor purely from its `request_template` +
-    `output_mapping` — no per-service Python needed. OCR, BentoBox
-    captioning, future CLIP/text-embedding endpoints, etc. all go through
-    this one function as long as they speak multipart-in/JSON-out."""
+    `output_mapping` — no per-service Python needed."""
     endpoint_url = processor.get("endpoint_url")
     if not endpoint_url:
         raise RuntimeError(f"processor '{processor['name']}' is type=http but has no endpoint_url")
@@ -500,6 +607,17 @@ def handle_http_json(asset_id, job_id, processor, file_bytes, name, mime_type, r
         except (TypeError, ValueError):
             confidence = None
 
+    # asset_interpretations.search_vector only indexes a key literally
+    # named 'raw_text' (see schema.sql). text_path tells us which field
+    # in THIS processor's response is the searchable text ("markdown",
+    # "text", "caption", ...) — copy it under that fixed name so full-text
+    # search actually has something to index, without touching the
+    # original response shape otherwise. Doesn't overwrite a payload that
+    # already happens to have its own 'raw_text' key.
+    text_value = _dig(payload, output_mapping.get("text_path"))
+    if text_value is not None and isinstance(payload, dict) and "raw_text" not in payload:
+        payload = {**payload, "raw_text": text_value}
+
     store_interpretation(
         asset_id, job_id, processor["id"], processor["name"],
         raw_payload=payload, confidence=confidence,
@@ -527,54 +645,102 @@ def dispatch_processor(asset_id, job_id, processor, file_bytes, name, mime_type,
 # per-asset dispatch
 # ============================================================
 
-def process_file(file_info: dict, processors: list, capability_index: dict):
+def run_stage(asset_id, name, mime_type, stage_id, processor, condition, capability_index,
+              file_bytes_holder, contract_id=None, contract_version=None, config=None, label=None):
+    """Shared by both dispatch paths: idempotency + condition check +
+    lazy download + job creation + dispatch + status marking.
+    file_bytes_holder is a 1-element list used as a mutable box so a
+    lazily-downloaded file is shared across stages for the same asset."""
+    if already_processed(asset_id, processor["id"], stage_id):
+        return
+
+    if not condition_met(asset_id, condition, capability_index):
+        return  # dependency not ready yet — retry next poll
+
+    if file_bytes_holder[0] is None:
+        file_bytes_holder[0] = supabase.storage.from_(SUPABASE_BUCKET).download(name)
+
+    job = create_job(
+        asset_id, processor["id"], stage_id=stage_id,
+        contract_id=contract_id, contract_version=contract_version,
+        configuration=config,
+    )
+    resolved_config = resolve_config(processor, job.get("configuration") or {})
+    tag = label or f"{processor['name']} ({processor['capability']})"
+    try:
+        dispatch_processor(asset_id, job["id"], processor, file_bytes_holder[0], name, mime_type, resolved_config)
+        mark_job(job["id"], "complete")
+        print(f"[scheduler] {name}: {tag} complete")
+    except Exception as exc:  # noqa: BLE001
+        mark_job(job["id"], "failed", str(exc))
+        print(f"[scheduler] {name}: {tag} FAILED — {exc}")
+        traceback.print_exc()
+
+
+def dispatch_via_contract(asset_id, name, mime_type, contract, processor_lookup, capability_index):
+    stages = resolve_pipeline_stages(contract, processor_lookup)
+    file_bytes_holder = [None]
+    for stage, processor in stages:
+        stage_id = stage.get("id") or DEFAULT_STAGE_ID
+        # stage's own condition, if the key is present (even as null),
+        # overrides the processor row's stored dispatch_condition for
+        # this contract; if absent, the row's own condition still applies
+        condition = stage.get("condition", processor.get("dispatch_condition"))
+        label = f"{contract['contract_id']}@{contract['version']}/{stage_id} -> {processor['name']}"
+        run_stage(
+            asset_id, name, mime_type, stage_id, processor, condition, capability_index,
+            file_bytes_holder,
+            contract_id=contract["contract_id"], contract_version=contract["version"],
+            config=stage.get("config"), label=label,
+        )
+
+
+def dispatch_legacy(asset_id, name, mime_type, default_processors, capability_index):
+    matches = applicable_processors(default_processors, mime_type)
+    if not matches:
+        return
+    # unconditioned first, so a same-cycle dependency usually resolves
+    # without waiting for the next poll
+    matches = sorted(matches, key=lambda p: p.get("dispatch_condition") is not None)
+    file_bytes_holder = [None]
+    for processor in matches:
+        run_stage(
+            asset_id, name, mime_type, DEFAULT_STAGE_ID, processor,
+            processor.get("dispatch_condition"), capability_index, file_bytes_holder,
+        )
+
+
+def process_file(file_info: dict, contracts: list, processor_lookup: dict,
+                  capability_index: dict, default_processors: list):
     name = file_info["name"]
     asset_id, mime_type = get_or_create_asset(file_info)
     if not mime_type:
         return
 
-    matches = applicable_processors(processors, mime_type)
-    if not matches:
-        return
-
-    # Unconditioned processors first, so a same-cycle dependency (e.g.
-    # metadata -> paddleocr gated on EXIF) usually resolves without
-    # waiting for the next poll.
-    matches = sorted(matches, key=lambda p: p.get("dispatch_condition") is not None)
-
-    file_bytes = None  # only fetched from Storage if something actually needs it
-    for processor in matches:
-        if already_processed(asset_id, processor["id"]):
-            continue
-
-        if not condition_met(asset_id, processor.get("dispatch_condition"), capability_index):
-            continue  # dependency not ready yet — retry next poll
-
-        if file_bytes is None:
-            file_bytes = supabase.storage.from_(SUPABASE_BUCKET).download(name)
-
-        job = create_job(asset_id, processor["id"])
-        resolved_config = resolve_config(processor, job.get("configuration") or {})
-        try:
-            dispatch_processor(asset_id, job["id"], processor, file_bytes, name, mime_type, resolved_config)
-            mark_job(job["id"], "complete")
-            print(f"[scheduler] {name}: {processor['name']} ({processor['capability']}) complete")
-        except Exception as exc:  # noqa: BLE001
-            mark_job(job["id"], "failed", str(exc))
-            print(f"[scheduler] {name}: {processor['name']} FAILED — {exc}")
-            traceback.print_exc()
+    contract = match_contract(contracts, mime_type)
+    if contract is not None:
+        dispatch_via_contract(asset_id, name, mime_type, contract, processor_lookup, capability_index)
+    else:
+        dispatch_legacy(asset_id, name, mime_type, default_processors, capability_index)
 
 
 def main():
     print(f"[scheduler] starting — bucket={SUPABASE_BUCKET} poll={POLL_INTERVAL_SECONDS}s")
     while True:
         try:
-            processors = get_dispatchable_processors()
+            processors = get_all_enabled_processors()
             if not processors:
-                print("[scheduler] no run_by_default+enabled processors found — nothing to dispatch")
+                print("[scheduler] no enabled processors found — nothing to dispatch")
             capability_index = build_capability_index(processors)
+            processor_lookup = build_processor_lookup(processors)
+            default_processors = [p for p in processors if p.get("run_by_default")]
+
+            contracts = get_contracts()
+            if not contracts:
+                print("[scheduler] no enabled ingest contracts — falling back to run_by_default dispatch only")
+
             for file_info in list_bucket_files():
-                process_file(file_info, processors, capability_index)
+                process_file(file_info, contracts, processor_lookup, capability_index, default_processors)
         except Exception as exc:  # noqa: BLE001
             print(f"[scheduler] poll loop error: {exc}")
             traceback.print_exc()
