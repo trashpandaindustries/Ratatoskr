@@ -324,12 +324,73 @@ def get_source_payload(asset_id: str, processor_ids: list) -> Optional[dict]:
     return result.data[0]["raw_payload"] if result.data else None
 
 
+def get_stage_interpretation(asset_id: str, stage_id: Optional[str]) -> Optional[dict]:
+    """The stored raw_payload for a specific stage_id's most recent
+    COMPLETE job on this asset — unlike get_source_payload (which
+    resolves 'any processor providing capability X'), this addresses one
+    exact stage by id. That distinction matters the moment two stages in
+    the same contract share a capability (e.g. 'text' and 'text-detailed'
+    both capability='ocr') — a capability-only lookup can't tell them
+    apart, and .limit(1) with no ordering would pick one arbitrarily."""
+    if not stage_id:
+        return None
+    job = (
+        supabase.table("processing_jobs")
+        .select("id")
+        .eq("asset_id", asset_id).eq("stage_id", stage_id).eq("status", "complete")
+        .limit(1).execute()
+    )
+    if not job.data:
+        return None
+    interp = (
+        supabase.table("asset_interpretations")
+        .select("raw_payload")
+        .eq("job_id", job.data[0]["id"])
+        .limit(1).execute()
+    )
+    return interp.data[0]["raw_payload"] if interp.data else None
+
+
+def resolve_stage_config(asset_id: str, raw_config: Optional[dict]) -> tuple:
+    """Resolve a contract stage's `config` block. Most values are
+    literals and pass through unchanged; a value shaped like
+    {"source": "stage_output", "stage_id": "...", "path": "..."} is
+    replaced with that field out of the named stage's own stored result
+    (via get_stage_interpretation) — this is what lets one stage's
+    output feed into another stage's config, e.g. a cleaner processor
+    receiving OCR text without Ratatoskr ever handing out an
+    asset_interpretation id or DB access to the processor itself.
+    Returns (resolved_dict, ready). ready=False means some referenced
+    stage hasn't produced a result yet — the caller should treat this
+    exactly like an unmet condition (skip, retry next poll) rather than
+    sending a None literal to the processor."""
+    if not raw_config:
+        return {}, True
+    resolved = {}
+    for key, value in raw_config.items():
+        if isinstance(value, dict) and value.get("source") == "stage_output":
+            payload = get_stage_interpretation(asset_id, value.get("stage_id"))
+            if payload is None:
+                return {}, False
+            resolved[key] = _dig(payload, value.get("path"))
+        else:
+            resolved[key] = value
+    return resolved, True
+
+
 def condition_met(asset_id: str, condition: Optional[dict], capability_index: dict) -> bool:
     if not condition:
         return True  # no condition declared — always applicable
 
-    source_ids = capability_index.get(condition.get("source_capability", "metadata"), [])
-    payload = get_source_payload(asset_id, source_ids)
+    # source_stage_id addresses one exact stage (unambiguous even when
+    # several stages share a capability); source_capability is the
+    # original "any processor providing this capability" lookup, kept
+    # for conditions that genuinely don't care which one produced it.
+    if condition.get("source_stage_id"):
+        payload = get_stage_interpretation(asset_id, condition["source_stage_id"])
+    else:
+        source_ids = capability_index.get(condition.get("source_capability", "metadata"), [])
+        payload = get_source_payload(asset_id, source_ids)
     if payload is None:
         return False  # dependency hasn't produced an interpretation yet — retry next poll
 
@@ -411,21 +472,65 @@ def get_or_create_asset(file_info: dict):
 # job bookkeeping — keyed on (asset_id, processor_id, stage_id)
 # ============================================================
 
-def already_processed(asset_id: str, processor_id: str, stage_id: str = DEFAULT_STAGE_ID) -> bool:
-    """True if a COMPLETE job already exists for this exact
-    (asset, processor, stage). Checking job status rather than
-    asset_interpretations existence means a previously FAILED stage is
-    retried on the next poll rather than treated as done."""
-    existing = (
+def get_job(asset_id: str, processor_id: str, stage_id: str = DEFAULT_STAGE_ID) -> Optional[dict]:
+    """The existing job row for this exact (asset, processor, stage), if
+    any. None means this stage has never been attempted for this asset."""
+    result = (
         supabase.table("processing_jobs")
-        .select("id")
+        .select("id, status, attempts, max_attempts, configuration")
         .eq("asset_id", asset_id)
         .eq("processor_id", processor_id)
         .eq("stage_id", stage_id)
-        .eq("status", "complete")
         .execute()
     )
-    return bool(existing.data)
+    return result.data[0] if result.data else None
+
+
+def job_is_terminal(job: Optional[dict]) -> bool:
+    """True if this stage should not be attempted again this poll or any
+    future one: either it already completed, or it has hit max_attempts
+    — whether those attempts were spent on real dispatch failures or on
+    a condition/config reference that never became ready. One counter,
+    one cap, for both reasons a stage can fail to ever complete — a
+    condition that will legitimately never be met (a contract typo, an
+    asset that will never match) would otherwise retry every poll
+    forever, which is exactly the "thousands of assets stuck fanning out
+    indefinitely" risk. Attempts below the cap still retry either way,
+    same as before."""
+    if job is None:
+        return False
+    if job["status"] == "complete":
+        return True
+    return (job.get("attempts") or 0) >= (job.get("max_attempts") or 3)
+
+
+def bump_pending_attempt(
+    asset_id: str, processor_id: str, stage_id: str,
+    contract_id: Optional[str], contract_version: Optional[int], reason: str,
+) -> None:
+    """Record that a stage was evaluated but wasn't ready to dispatch
+    (unmet condition, or a stage_output config reference with no result
+    yet). Creates the job row on first attempt, otherwise increments its
+    attempts — same counter job_is_terminal checks, so this is what lets
+    an unmet condition eventually stop being retried instead of running
+    every poll forever."""
+    existing = get_job(asset_id, processor_id, stage_id)
+    if existing:
+        supabase.table("processing_jobs").update({
+            "attempts": (existing.get("attempts") or 0) + 1,
+            "error_message": reason,
+        }).eq("id", existing["id"]).execute()
+    else:
+        supabase.table("processing_jobs").insert({
+            "asset_id": asset_id,
+            "processor_id": processor_id,
+            "stage_id": stage_id,
+            "contract_id": contract_id,
+            "contract_version": contract_version,
+            "status": "pending",
+            "attempts": 1,
+            "error_message": reason,
+        }).execute()
 
 
 def create_job(
@@ -460,10 +565,12 @@ def create_job(
     return row.data[0]
 
 
-def mark_job(job_id: str, status: str, error_message: Optional[str] = None):
+def mark_job(job_id: str, status: str, error_message: Optional[str] = None, attempts: Optional[int] = None):
     fields = {"status": status}
     if error_message is not None:
         fields["error_message"] = error_message
+    if attempts is not None:
+        fields["attempts"] = attempts
     supabase.table("processing_jobs").update(fields).eq("id", job_id).execute()
 
 
@@ -647,15 +754,32 @@ def dispatch_processor(asset_id, job_id, processor, file_bytes, name, mime_type,
 
 def run_stage(asset_id, name, mime_type, stage_id, processor, condition, capability_index,
               file_bytes_holder, contract_id=None, contract_version=None, config=None, label=None):
-    """Shared by both dispatch paths: idempotency + condition check +
-    lazy download + job creation + dispatch + status marking.
-    file_bytes_holder is a 1-element list used as a mutable box so a
-    lazily-downloaded file is shared across stages for the same asset."""
-    if already_processed(asset_id, processor["id"], stage_id):
+    """Shared by both dispatch paths: terminal check + condition check +
+    stage_output config resolution + lazy download + job creation +
+    dispatch + status marking. file_bytes_holder is a 1-element list used
+    as a mutable box so a lazily-downloaded file is shared across stages
+    for the same asset. A stage that isn't ready yet (unmet condition, or
+    a stage_output reference with no result) bumps an attempt counter
+    rather than silently no-op'ing, so it eventually stops being retried
+    — see job_is_terminal."""
+    job_row = get_job(asset_id, processor["id"], stage_id)
+    if job_is_terminal(job_row):
         return
 
     if not condition_met(asset_id, condition, capability_index):
-        return  # dependency not ready yet — retry next poll
+        bump_pending_attempt(
+            asset_id, processor["id"], stage_id, contract_id, contract_version,
+            reason="condition not met",
+        )
+        return  # dependency not ready yet — retry next poll, up to max_attempts
+
+    resolved_stage_config, config_ready = resolve_stage_config(asset_id, config)
+    if not config_ready:
+        bump_pending_attempt(
+            asset_id, processor["id"], stage_id, contract_id, contract_version,
+            reason="referenced stage_output not ready",
+        )
+        return  # referenced stage hasn't produced a result yet — retry next poll
 
     if file_bytes_holder[0] is None:
         file_bytes_holder[0] = supabase.storage.from_(SUPABASE_BUCKET).download(name)
@@ -663,7 +787,10 @@ def run_stage(asset_id, name, mime_type, stage_id, processor, condition, capabil
     job = create_job(
         asset_id, processor["id"], stage_id=stage_id,
         contract_id=contract_id, contract_version=contract_version,
-        configuration=config,
+        # only overwrite stored configuration when this stage actually
+        # declared one — None here (legacy path, or a contract stage with
+        # no config block) leaves any prior value alone, same as before
+        configuration=resolved_stage_config if config is not None else None,
     )
     resolved_config = resolve_config(processor, job.get("configuration") or {})
     tag = label or f"{processor['name']} ({processor['capability']})"
@@ -672,7 +799,7 @@ def run_stage(asset_id, name, mime_type, stage_id, processor, condition, capabil
         mark_job(job["id"], "complete")
         print(f"[scheduler] {name}: {tag} complete")
     except Exception as exc:  # noqa: BLE001
-        mark_job(job["id"], "failed", str(exc))
+        mark_job(job["id"], "failed", str(exc), attempts=(job.get("attempts") or 0) + 1)
         print(f"[scheduler] {name}: {tag} FAILED — {exc}")
         traceback.print_exc()
 
