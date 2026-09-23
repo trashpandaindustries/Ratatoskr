@@ -122,6 +122,7 @@ import requests
 from PIL import Image
 from PIL.ExifTags import GPSTAGS, TAGS
 from pypdf import PdfReader
+from pypdf.generic import NullObject
 from supabase import Client, create_client
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
@@ -168,7 +169,7 @@ def get_all_enabled_processors():
         .select(
             "id, name, capability, service, type, endpoint_url, input_mime_types, "
             "config_schema, default_config, request_template, output_mapping, "
-            "dispatch_condition, run_by_default"
+            "dispatch_condition, run_by_default, followup"
         )
         .eq("enabled", True)
         .execute()
@@ -477,7 +478,7 @@ def get_job(asset_id: str, processor_id: str, stage_id: str = DEFAULT_STAGE_ID) 
     any. None means this stage has never been attempted for this asset."""
     result = (
         supabase.table("processing_jobs")
-        .select("id, status, attempts, max_attempts, configuration")
+        .select("id, status, attempts, max_attempts, configuration, result")
         .eq("asset_id", asset_id)
         .eq("processor_id", processor_id)
         .eq("stage_id", stage_id)
@@ -565,12 +566,15 @@ def create_job(
     return row.data[0]
 
 
-def mark_job(job_id: str, status: str, error_message: Optional[str] = None, attempts: Optional[int] = None):
+def mark_job(job_id: str, status: str, error_message: Optional[str] = None,
+             attempts: Optional[int] = None, result: Optional[dict] = None):
     fields = {"status": status}
     if error_message is not None:
         fields["error_message"] = error_message
     if attempts is not None:
         fields["attempts"] = attempts
+    if result is not None:
+        fields["result"] = result
     supabase.table("processing_jobs").update(fields).eq("id", job_id).execute()
 
 
@@ -594,8 +598,11 @@ def store_interpretation(
 # ============================================================
 
 def _sanitize(value):
-    """Coerce PIL/pypdf value types (IFDRational, bytes, nested tuples)
-    into plain JSON-serializable types for storage in raw_payload."""
+    """Coerce PIL/pypdf value types (IFDRational, bytes, nested tuples,
+    pypdf's NullObject) into plain JSON-serializable types for storage in
+    raw_payload."""
+    if isinstance(value, NullObject):
+        return None
     if isinstance(value, bytes):
         try:
             return value.decode("utf-8", errors="replace")
@@ -662,15 +669,10 @@ INTERNAL_HANDLERS = {
 # http capability — generic, template-driven request/response handling
 # ============================================================
 
-def handle_http_json(asset_id, job_id, processor, file_bytes, name, mime_type, resolved_config):
-    """Runs ANY http-type processor purely from its `request_template` +
-    `output_mapping` — no per-service Python needed."""
-    endpoint_url = processor.get("endpoint_url")
-    if not endpoint_url:
-        raise RuntimeError(f"processor '{processor['name']}' is type=http but has no endpoint_url")
-
-    template = processor.get("request_template") or {}
-
+def _build_multipart_request(processor_name, template, file_bytes, name, mime_type, resolved_config):
+    """Shared by handle_http_json and handle_http_async_submit — both
+    build the same kind of outbound request from `request_template`,
+    they just differ in how they treat the response."""
     files = {}
     data = {}
     for field, spec in (template.get("multipart") or {}).items():
@@ -684,28 +686,23 @@ def handle_http_json(asset_id, job_id, processor, file_bytes, name, mime_type, r
             key = spec.get("key")
             if key is None or key not in resolved_config:
                 print(
-                    f"[scheduler] processor '{processor['name']}': config_field "
+                    f"[scheduler] processor '{processor_name}': config_field "
                     f"'{key}' not present in resolved config — skipping field '{field}'"
                 )
                 continue
             data[field] = resolved_config[key]
         else:
             print(
-                f"[scheduler] processor '{processor['name']}': unknown multipart "
+                f"[scheduler] processor '{processor_name}': unknown multipart "
                 f"source '{source}' for field '{field}' — skipping field"
             )
+    return files, data
 
-    resp = requests.request(
-        template.get("method", "POST"),
-        endpoint_url,
-        headers=template.get("headers") or {},
-        files=files or None,
-        data=data or None,
-        timeout=120,
-    )
-    resp.raise_for_status()
-    payload = resp.json()
 
+def _store_http_result(asset_id, job_id, processor, payload):
+    """Shared by the synchronous path and the async path's completion
+    step — both end up with a JSON response that needs the same
+    confidence/raw_text extraction before being stored."""
     output_mapping = processor.get("output_mapping") or {}
     confidence = _dig(payload, output_mapping.get("confidence_path"))
     if confidence is not None:
@@ -731,6 +728,173 @@ def handle_http_json(asset_id, job_id, processor, file_bytes, name, mime_type, r
     )
 
 
+def handle_http_json(asset_id, job_id, processor, file_bytes, name, mime_type, resolved_config):
+    """Runs ANY synchronous http-type processor purely from its
+    `request_template` + `output_mapping` — no per-service Python needed.
+    Returns None (run_stage treats that as "complete")."""
+    endpoint_url = processor.get("endpoint_url")
+    if not endpoint_url:
+        raise RuntimeError(f"processor '{processor['name']}' is type=http but has no endpoint_url")
+
+    template = processor.get("request_template") or {}
+    files, data = _build_multipart_request(processor["name"], template, file_bytes, name, mime_type, resolved_config)
+
+    resp = requests.request(
+        template.get("method", "POST"),
+        endpoint_url,
+        headers=template.get("headers") or {},
+        files=files or None,
+        data=data or None,
+        timeout=120,
+    )
+    resp.raise_for_status()
+    _store_http_result(asset_id, job_id, processor, resp.json())
+
+
+# ============================================================
+# http_async capability — submit now, poll a followup endpoint later
+# ============================================================
+#
+# `followup` (JSONB on the processors row):
+#   {
+#     "id_path": "job_id",                 -- dotted path into the SUBMIT
+#                                              response for the external job id
+#     "status_url": ".../jobs/{external_ref}",   -- {external_ref} substituted
+#     "state_path": "status",              -- dotted path into the STATUS
+#                                              response
+#     "done_states": ["completed"],
+#     "failed_states": ["failed", "error"],
+#     "result_url": ".../jobs/{external_ref}/result",
+#     "poll_interval_seconds": 15,
+#     "timeout_seconds": 1800
+#   }
+# status_url/result_url are complete templates the processor row itself
+# owns — NOT derived from endpoint_url by convention, since endpoint_url
+# is the submit URL and its shape varies too much per service to safely
+# concatenate a path onto it.
+
+def handle_http_async_submit(asset_id, job_id, processor, file_bytes, name, mime_type, resolved_config):
+    """The submit half only. Returns {"status": "submitted", "result":
+    {...}} rather than storing an interpretation — run_stage persists
+    that into processing_jobs.result and moves the job to status
+    'submitted'; poll_async_job (called on later polls, bypassing this
+    function entirely) handles checking on it and eventually storing the
+    real interpretation."""
+    endpoint_url = processor.get("endpoint_url")
+    if not endpoint_url:
+        raise RuntimeError(f"processor '{processor['name']}' is type=http_async but has no endpoint_url")
+
+    followup = processor.get("followup") or {}
+    if not followup.get("status_url") or not followup.get("id_path"):
+        raise RuntimeError(
+            f"processor '{processor['name']}' is type=http_async but followup.status_url/id_path is not configured"
+        )
+
+    template = processor.get("request_template") or {}
+    files, data = _build_multipart_request(processor["name"], template, file_bytes, name, mime_type, resolved_config)
+
+    resp = requests.request(
+        template.get("method", "POST"),
+        endpoint_url,
+        headers=template.get("headers") or {},
+        files=files or None,
+        data=data or None,
+        timeout=120,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+
+    external_ref = _dig(payload, followup.get("id_path"))
+    if external_ref is None:
+        raise RuntimeError(
+            f"processor '{processor['name']}': submit response missing id at '{followup.get('id_path')}'"
+        )
+
+    now = time.time()
+    return {
+        "status": "submitted",
+        "result": {
+            "external_ref": external_ref,
+            "submitted_at": now,
+            "next_poll_at": now + (followup.get("poll_interval_seconds") or 30),
+        },
+    }
+
+
+def _reschedule_next_poll(job_id, result_blob, followup, now):
+    interval = followup.get("poll_interval_seconds") or 30
+    supabase.table("processing_jobs").update(
+        {"result": {**result_blob, "next_poll_at": now + interval}}
+    ).eq("id", job_id).execute()
+
+
+def poll_async_job(asset_id, name, job, processor):
+    """Called from run_stage instead of the normal dispatch path whenever
+    a job's status is already 'submitted'. Checks timeout first (no
+    network call needed), then next_poll_at (avoid hammering the status
+    endpoint faster than the processor asked to be polled), then
+    actually checks status, and only fetches+stores the real result once
+    the remote side reports done."""
+    followup = processor.get("followup") or {}
+    result_blob = job.get("result") or {}
+    external_ref = result_blob.get("external_ref")
+    submitted_at = result_blob.get("submitted_at")
+    next_poll_at = result_blob.get("next_poll_at")
+    now = time.time()
+
+    timeout_seconds = followup.get("timeout_seconds")
+    if timeout_seconds is not None and submitted_at is not None and (now - submitted_at) > timeout_seconds:
+        # Deliberately terminal, not just another failed attempt: a job
+        # that's been running this long already spent real time on the
+        # external service, so we don't auto-resubmit by letting the
+        # normal attempts-based retry pick it up again. Forcing attempts
+        # to max_attempts here makes job_is_terminal treat it as done.
+        mark_job(
+            job["id"], "failed",
+            f"timed out waiting on external job after {timeout_seconds}s",
+            attempts=job.get("max_attempts") or 3,
+        )
+        print(f"[scheduler] {name}: {processor['name']} TIMED OUT after {timeout_seconds}s")
+        return
+
+    if next_poll_at is not None and now < next_poll_at:
+        return  # not due yet — honor the processor's own poll_interval_seconds
+
+    status_url = (followup.get("status_url") or "").format(external_ref=external_ref)
+    try:
+        resp = requests.get(status_url, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        # a transient failure to even CHECK status isn't the job failing
+        # — just try again at the next scheduled interval
+        print(f"[scheduler] {name}: {processor['name']} status check failed — {exc}")
+        _reschedule_next_poll(job["id"], result_blob, followup, now)
+        return
+
+    state = _dig(payload, followup.get("state_path"))
+
+    if state in (followup.get("failed_states") or []):
+        mark_job(
+            job["id"], "failed", f"external job reported state '{state}'",
+            attempts=(job.get("attempts") or 0) + 1,
+        )
+        print(f"[scheduler] {name}: {processor['name']} FAILED (remote state '{state}')")
+        return
+
+    if state in (followup.get("done_states") or []):
+        result_url = (followup.get("result_url") or "").format(external_ref=external_ref)
+        result_resp = requests.get(result_url, timeout=120)
+        result_resp.raise_for_status()
+        _store_http_result(asset_id, job["id"], processor, result_resp.json())
+        mark_job(job["id"], "complete")
+        print(f"[scheduler] {name}: {processor['name']} complete (async)")
+        return
+
+    # still running — neither done nor failed yet
+    _reschedule_next_poll(job["id"], result_blob, followup, now)
+
+
 # ============================================================
 # dispatch — `type` decides HOW to run, `capability` is just a label
 # ============================================================
@@ -741,9 +905,11 @@ def dispatch_processor(asset_id, job_id, processor, file_bytes, name, mime_type,
         handler = INTERNAL_HANDLERS.get(processor["capability"])
         if not handler:
             raise RuntimeError(f"no internal handler for capability '{processor['capability']}'")
-        handler(asset_id, job_id, processor, file_bytes, name, mime_type, resolved_config)
+        return handler(asset_id, job_id, processor, file_bytes, name, mime_type, resolved_config)
     elif ptype == "http":
-        handle_http_json(asset_id, job_id, processor, file_bytes, name, mime_type, resolved_config)
+        return handle_http_json(asset_id, job_id, processor, file_bytes, name, mime_type, resolved_config)
+    elif ptype == "http_async":
+        return handle_http_async_submit(asset_id, job_id, processor, file_bytes, name, mime_type, resolved_config)
     else:
         raise RuntimeError(f"unknown processor type '{ptype}'")
 
@@ -764,6 +930,13 @@ def run_stage(asset_id, name, mime_type, stage_id, processor, condition, capabil
     — see job_is_terminal."""
     job_row = get_job(asset_id, processor["id"], stage_id)
     if job_is_terminal(job_row):
+        return
+
+    if job_row and job_row.get("status") == "submitted":
+        # already dispatched on an earlier poll and waiting on an
+        # external job — check on it instead of re-running condition,
+        # config resolution, or the submit request all over again
+        poll_async_job(asset_id, name, job_row, processor)
         return
 
     if not condition_met(asset_id, condition, capability_index):
@@ -795,9 +968,13 @@ def run_stage(asset_id, name, mime_type, stage_id, processor, condition, capabil
     resolved_config = resolve_config(processor, job.get("configuration") or {})
     tag = label or f"{processor['name']} ({processor['capability']})"
     try:
-        dispatch_processor(asset_id, job["id"], processor, file_bytes_holder[0], name, mime_type, resolved_config)
-        mark_job(job["id"], "complete")
-        print(f"[scheduler] {name}: {tag} complete")
+        outcome = dispatch_processor(asset_id, job["id"], processor, file_bytes_holder[0], name, mime_type, resolved_config)
+        if isinstance(outcome, dict) and outcome.get("status") == "submitted":
+            mark_job(job["id"], "submitted", result=outcome.get("result"))
+            print(f"[scheduler] {name}: {tag} submitted — awaiting async result")
+        else:
+            mark_job(job["id"], "complete")
+            print(f"[scheduler] {name}: {tag} complete")
     except Exception as exc:  # noqa: BLE001
         mark_job(job["id"], "failed", str(exc), attempts=(job.get("attempts") or 0) + 1)
         print(f"[scheduler] {name}: {tag} FAILED — {exc}")
